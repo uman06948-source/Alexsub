@@ -1,37 +1,23 @@
 # ALEXSUB
 
-Responsive Nigerian VTU demo app: **Affordable Data. Instant Connections.** The current repository version is a development/demo scaffold; simulated services only. It is not a real-money wallet and makes no live VTUGATE/provider requests.
+Responsive Nigerian VTU application, running in explicitly marked demo mode. No live provider calls, real deposits, transfers, or withdrawals are enabled.
 
-## Run locally
+## Setup
+1. Node.js 20+, PostgreSQL 14+, npm.
+2. `cp .env.example .env`, configure a PostgreSQL database and a random `SESSION_SECRET` (32+ characters).
+3. `npm install`
+4. `npm run db:migrate`
+5. `npm run dev` (Vite: 5173, Express API: 3001) or `npm run build`.
 
-- Node.js 20+ and npm
-- `cp .env.example .env`, then replace `SESSION_SECRET` with a long random value.
-- `npm install`
-- `npm run dev` (Vite at port 5173, Express API at port 3001)
-- `npm run build`
+The API now uses PostgreSQL for users, wallets, immutable ledger entries, demo payments, plans, transactions, refunds, audit logs, notifications, and persistent sessions. The migrations seed illustrative data plan prices explicitly marked DEMO. Do not treat those amounts as provider pricing or real value.
 
-The demo app currently keeps users, balances, and transactions in process memory; restarting the server clears them. PostgreSQL/Drizzle schema and migration tooling are present as a foundation but are not yet wired into runtime persistence. Do not deploy this in-memory demo as a production service.
+## Development administrator
+Set `ADMIN_EMAIL` and `ADMIN_PASSWORD` (at least 12 chars) in `.env`, then run `npm run db:seed-admin`. The script provisions/updates an administrator; there is no public admin registration endpoint. Never use a default production password. Admin API login is `/api/admin/login`; all admin APIs require a role-checked session. The current React frontend is customer-focused; admin REST endpoints are provided for an admin UI integration.
 
-## Demo behavior
+## Demo behavior and security notes
+Fixed ₦5,000 simulated credits are added only by a server endpoint and are recorded in wallet ledger and payments tables. Purchases reserve/debit from a locked wallet, are idempotent by user/key, and have provider requests only to `mockProvider`; confirmed simulated failures are refunded once. If provider execution or DB finalization errors, transaction remains PROCESSING and is not automatically repeated. No electricity tokens, real credits, deposits, or live VTU products are generated.
 
-Register a customer account in the UI, add fixed ₦5,000 simulated demo credits, then try data or airtime. Sample plan prices are explicitly illustrative and do not represent provider prices. Provider results are simulated. No real airtime/data is delivered, credits cannot be withdrawn, and no deposit or transfer is enabled. No default administrator credentials or public admin registration are provided.
-
-## Layout
-
-- `src/` — React, TypeScript, responsive interface and styles
-- `server/` — Express API, validation, password hashing, mock provider boundary
-- `server/db/schema.ts` — PostgreSQL/Drizzle table definitions
-- `server/providers/` — provider interface, active mock adapter, disabled VTUGATE placeholder
-- `drizzle.config.ts` — migration generator configuration
-
-## Environment
-
-See `.env.example`. `DATABASE_URL` is used by Drizzle migration tooling, but runtime routes in this scaffold are in-memory. `SESSION_SECRET` must be a private random secret outside local development. `DEMO_MODE=false` disables demo credit and purchase endpoints. Never put API credentials in frontend variables.
+The API uses bcrypt, Zod validation, rate limiting, Helmet, PostgreSQL-backed sessions, httpOnly SameSite cookies, and parameterized SQL. HTTPS and secure session cookies are expected in production; CSRF defense, email verification, password recovery, full admin frontend, customer support persistence, FCM, and advanced production monitoring are not yet implemented. This code has not been run in this tool environment. Review and test before deploying or handling personal data.
 
 ## VTUGATE
-
-The active provider is `mockProvider.ts`. The VTUGATE adapter in `server/providers/vtugateService.ts` intentionally throws and is not wired into purchases. The available documentation search did not establish exact endpoint paths, form fields, or response schemas. Before implementation, consult the current official documentation at <https://vtugate.com/docs>, confirm the authorized account/eligibility and exact documented request/response contract, then implement server-only HTTPS Bearer requests with documented form encoding. Do not enable live purchases until independently tested and explicitly authorized. `VITEGATE_API_KEY` is intentionally unused and must not be exposed in a browser build.
-
-## Security and production gaps
-
-The API uses bcrypt password hashing, input validation, basic auth rate limiting, Helmet, HTTP-only SameSite session cookies, and idempotency keys. This is a demo baseline, not a production security review. Session storage is Express's in-memory default; CSRF protections, persistent DB transactions/ledger enforcement, account verification/reset flows, admin management, production migrations/seeds, FCM, and live service providers are not implemented. Add a persistent PostgreSQL-backed session store, CSRF defenses, and atomic DB transactions before any deployment with user data or money. Set HTTPS and secure cookies in production.
+The active adapter is `mockProvider`. `vtugateService.ts` stays disabled; its exact routes and payload fields must be implemented only from current official documentation and with authorized credentials. No provider key is sent to the browser. Do not enable live purchases before authorized end-to-end testing.

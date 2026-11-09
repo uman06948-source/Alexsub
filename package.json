@@ -9,14 +9,15 @@
     "dev:client": "vite --host 0.0.0.0",
     "build": "tsc --noEmit && vite build",
     "start": "tsx server/index.ts",
+    "db:migrate": "psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f server/db/migrations/0001_init.sql",
     "db:generate": "drizzle-kit generate",
-    "db:migrate": "drizzle-kit migrate",
     "db:studio": "drizzle-kit studio"
   },
   "dependencies": {
     "@vitejs/plugin-react": "^4.3.4",
     "axios": "^1.7.9",
     "bcryptjs": "^2.4.3",
+    "connect-pg-simple": "^10.0.0",
     "drizzle-orm": "^0.38.4",
     "express": "^4.21.2",
     "express-rate-limit": "^7.5.0",
@@ -30,6 +31,7 @@
   },
   "devDependencies": {
     "@types/bcryptjs": "^2.4.1",
+    "@types/connect-pg-simple": "^7.0.3",
     "@types/express": "^5.0.0",
     "@types/express-session": "^1.18.1",
     "@types/node": "^22.10.5",

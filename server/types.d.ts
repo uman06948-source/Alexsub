@@ -1,2 +1,1 @@
-import 'express-session';
-declare module 'express-session' { interface SessionData { userId?: string; admin?: boolean } }
+connect-pg-simple typings none?
