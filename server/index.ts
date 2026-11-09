@@ -15,40 +15,233 @@ const production = process.env.NODE_ENV === 'production';
 app.set('trust proxy', production ? 1 : false);
 app.use(helmet());
 app.use(express.json({ limit: '32kb' }));
-if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32) throw new Error('Set SESSION_SECRET to a random value of at least 32 characters.');
-app.use(session({ store: new PgStore({ pool, tableName: 'sessions', createTableIfMissing: false }), name: 'alexsub.sid', secret: process.env.SESSION_SECRET, resave: false, saveUninitialized: false, cookie: { httpOnly: true, sameSite: 'lax', secure: production, maxAge: 7 * 86400000 } }));
+if (!process.env.SESSION_SECRET || process.env.SESSION_SECRET.length < 32) {
+  throw new Error('Set SESSION_SECRET to a random value of at least 32 characters.');
+}
+app.use(session({
+  store: new PgStore({ pool, tableName: 'sessions', createTableIfMissing: false }),
+  name: 'alexsub.sid', secret: process.env.SESSION_SECRET, resave: false,
+  saveUninitialized: false,
+  cookie: { httpOnly: true, sameSite: 'lax', secure: production, maxAge: 7 * 86400000 }
+}));
 const authLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 30, standardHeaders: true, legacyHeaders: false });
 const adminLimiter = rateLimit({ windowMs: 15 * 60_000, limit: 10, standardHeaders: true, legacyHeaders: false });
 type AuthedRequest = express.Request & { user?: { id: string; name: string; email: string; role: string } };
+
 async function requireUser(req: AuthedRequest, res: express.Response, next: express.NextFunction) {
   if (!req.session.userId) return res.status(401).json({ error: 'Please sign in.' });
-  try { const result = await pool.query('SELECT id,name,email,role,suspended FROM users WHERE id=$1', [req.session.userId]); const user = result.rows[0]; if (!user || user.suspended) { req.session.destroy(() => {}); return res.status(401).json({ error: 'Account unavailable.' }); } req.user = user; next(); }
-  catch { res.status(500).json({ error: 'Could not verify session.' }); }
+  try {
+    const { rows } = await pool.query('SELECT id,name,email,role,suspended FROM users WHERE id=$1', [req.session.userId]);
+    const user = rows[0];
+    if (!user || user.suspended) {
+      req.session.destroy(() => {});
+      return res.status(401).json({ error: 'Account unavailable.' });
+    }
+    req.user = user;
+    next();
+  } catch { res.status(500).json({ error: 'Could not verify session.' }); }
 }
-const customer = (req: AuthedRequest, res: express.Response, next: express.NextFunction) => requireUser(req,res,()=> req.user?.role === 'ADMIN' ? next() : next());
-const admin = (req: AuthedRequest, res: express.Response, next: express.NextFunction) => requireUser(req,res,()=> req.user?.role === 'ADMIN' ? next() : res.status(403).json({error:'Administrator access required.'}));
-const writeAudit = (actor:string, action:string, target?:string, details?:string) => pool.query('INSERT INTO audit_logs(actor_id,action,target,details) VALUES($1,$2,$3,$4)',[actor,action,target??null,details??null]);
-app.get('/api/health', async (_req,res) => { try { await pool.query('SELECT 1'); res.json({ok:true,demo:true,provider:'mock',database:'connected'}); } catch { res.status(503).json({ok:false,database:'unavailable'}); } });
-app.get('/api/plans', async (_req,res) => { try { const {rows}=await pool.query('SELECT id,network,size,validity,category,price_kobo AS "priceKobo",is_demo AS "isDemo" FROM data_plans WHERE active=true ORDER BY network,price_kobo'); res.json(rows); } catch { res.status(500).json({error:'Plans unavailable.'}); } });
-app.post('/api/auth/register',authLimiter,async(req,res)=>{const parsed=z.object({name:z.string().trim().min(2).max(80),email:z.string().trim().email().max(254),phone:z.string().regex(/^\+?[0-9]{10,14}$/),password:z.string().min(8).max(128)}).safeParse(req.body);if(!parsed.success)return res.status(400).json({error:'Check the registration details.'});const {name,email,phone,password}=parsed.data;const client=await pool.connect();try{await client.query('BEGIN');const hash=await bcrypt.hash(password,12);const result=await client.query('INSERT INTO users(account_id,name,email,phone,password_hash) VALUES($1,$2,$3,$4,$5) RETURNING id,account_id AS "accountId",name,email', [`AX-${randomUUID().slice(0,10).toUpperCase()}`,name,email.toLowerCase(),phone,hash]);const u=result.rows[0];await client.query('INSERT INTO wallets(user_id) VALUES($1)',[u.id]);await client.query('INSERT INTO notifications(user_id,title,body) VALUES($1,$2,$3)',[u.id,'Welcome to Alexsub','Your demo account is ready.']);await client.query('COMMIT');req.session.userId=u.id;res.status(201).json({id:u.accountId,name:u.name,email:u.email});}catch(e:any){await client.query('ROLLBACK');res.status(e.code==='23505'?409:500).json({error:e.code==='23505'?'An account with this email already exists.':'Registration failed.'});}finally{client.release();}});
-app.post('/api/auth/login',authLimiter,async(req,res)=>{const parsed=z.object({email:z.string().email(),password:z.string().min(1).max(128)}).safeParse(req.body);if(!parsed.success)return res.status(400).json({error:'Enter a valid email and password.'});try{const {rows}=await pool.query('SELECT id,account_id AS "accountId",name,email,password_hash,suspended FROM users WHERE email=$1',[parsed.data.email.toLowerCase()]);const u=rows[0];if(!u||!await bcrypt.compare(parsed.data.password,u.password_hash)||u.suspended)return res.status(401).json({error:'Email or password is incorrect.'});req.session.regenerate(err=>{if(err)return res.status(500).json({error:'Could not create session.'});req.session.userId=u.id;req.session.save(e=>e?res.status(500).json({error:'Could not save session.'}):res.json({id:u.accountId,name:u.name,email:u.email,role:u.role}));});}catch{res.status(500).json({error:'Sign in unavailable.'});}});
-app.get('/api/auth/me',requireUser,(req:AuthedRequest,res)=>res.json({id:req.user!.id,name:req.user!.name,email:req.user!.email,role:req.user!.role}));
-app.post('/api/auth/logout',(req,res)=>req.session.destroy(()=>{res.clearCookie('alexsub.sid');res.status(204).end();}));
-app.get('/api/wallet',requireUser,async(req:AuthedRequest,res)=>{try{const {rows}=await pool.query('SELECT balance_kobo AS "balanceKobo" FROM wallets WHERE user_id=$1',[req.user!.id]);res.json({...rows[0],demo:true});}catch{res.status(500).json({error:'Wallet unavailable.'});}});
-app.get('/api/wallet/ledger',requireUser,async(req:AuthedRequest,res)=>{try{const {rows}=await pool.query('SELECT l.amount_kobo AS "amountKobo",l.entry_type AS "entryType",l.reference,l.description,l.created_at AS "createdAt" FROM wallet_ledger l JOIN wallets w ON l.wallet_id=w.id WHERE w.user_id=$1 ORDER BY l.created_at DESC LIMIT 100',[req.user!.id]);res.json(rows);}catch{res.status(500).json({error:'Ledger unavailable.'});}});
-app.post('/api/wallet/demo-credit',requireUser,async(req:AuthedRequest,res)=>{if(process.env.DEMO_MODE==='false')return res.status(403).json({error:'Demo credits are disabled.'});if(!z.object({amountNaira:z.literal(5000)}).safeParse(req.body).success)return res.status(400).json({error:'Only the fixed demo credit amount is available.'});const ref=`DEMO-${randomUUID()}`;const c=await pool.connect();try{await c.query('BEGIN');const w=await c.query('UPDATE wallets SET balance_kobo=balance_kobo+500000 WHERE user_id=$1 RETURNING id,balance_kobo',[req.user!.id]);if(!w.rowCount)throw Error('wallet');await c.query('INSERT INTO wallet_ledger(wallet_id,amount_kobo,entry_type,reference,description) VALUES($1,500000,$2,$3,$4)',[w.rows[0].id,'DEMO_CREDIT',ref,'Simulated demo credits']);await c.query('INSERT INTO payments(user_id,reference,amount_kobo,status,demo) VALUES($1,$2,500000,$3,true)',[req.user!.id,ref,'SIMULATED']);await c.query('INSERT INTO notifications(user_id,title,body) VALUES($1,$2,$3)',[req.user!.id,'Demo credits added','₦5,000 simulated credits added; not real money.']);await c.query('COMMIT');res.json({balanceKobo:w.rows[0].balance_kobo,demo:true});}catch{await c.query('ROLLBACK');res.status(500).json({error:'Could not add demo credits.'});}finally{c.release();}});
-app.get('/api/transactions',requireUser,async(req:AuthedRequest,res)=>{try{const {rows}=await pool.query('SELECT reference,service,network,recipient,product,amount_kobo AS "amountKobo",status,created_at AS "createdAt",demo FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100',[req.user!.id]);res.json(rows);}catch{res.status(500).json({error:'Transactions unavailable.'});}});
-app.post('/api/transactions/purchase',requireUser,async(req:AuthedRequest,res)=>{if(process.env.DEMO_MODE==='false')return res.status(403).json({error:'Demo purchase engine is disabled.'});const key=req.get('Idempotency-Key');if(!key||key.length>100)return res.status(400).json({error:'A valid idempotency key is required.'});const parsed=z.object({service:z.enum(['DATA','AIRTIME']),network:z.enum(['MTN','Airtel','Glo','9mobile']),recipient:z.string().regex(/^\+?[0-9]{10,14}$/),planId:z.string().uuid().optional(),amountNaira:z.number().min(50).max(10000).optional()}).safeParse(req.body);if(!parsed.success)return res.status(400).json({error:'Check the purchase details.'});const p=parsed.data;const c=await pool.connect();let tx:any;try{await c.query('BEGIN');const prior=await c.query('SELECT reference,service,network,recipient,product,amount_kobo AS "amountKobo",status,created_at AS "createdAt",demo FROM transactions WHERE user_id=$1 AND idempotency_key=$2',[req.user!.id,key]);if(prior.rowCount){await c.query('COMMIT');return res.json(prior.rows[0]);}let product:string;let amountKobo:number;if(p.service==='DATA'){if(!p.planId)throw Object.assign(Error('Select a data plan.'),{http:400});const plan=await c.query('SELECT size,network,price_kobo FROM data_plans WHERE id=$1 AND active=true',[p.planId]);if(!plan.rowCount||plan.rows[0].network!==p.network)throw Object.assign(Error('Invalid data plan.'),{http:400});product=plan.rows[0].size;amountKobo=plan.rows[0].price_kobo;}else{if(!p.amountNaira)throw Object.assign(Error('Enter airtime amount.'),{http:400});product=`₦${p.amountNaira} Airtime`;amountKobo=Math.round(p.amountNaira*100);}const wallet=await c.query('SELECT id,balance_kobo FROM wallets WHERE user_id=$1 FOR UPDATE',[req.user!.id]);if(!wallet.rowCount||wallet.rows[0].balance_kobo<amountKobo)throw Object.assign(Error('Insufficient demo balance. Add demo credits first.'),{http:400});const reference=`AXD-${randomUUID().slice(0,12).toUpperCase()}`;await c.query('UPDATE wallets SET balance_kobo=balance_kobo-$1 WHERE id=$2',[amountKobo,wallet.rows[0].id]);await c.query('INSERT INTO wallet_ledger(wallet_id,amount_kobo,entry_type,reference,description) VALUES($1,$2,$3,$4,$5)',[wallet.rows[0].id,-amountKobo,'PURCHASE',reference,`Demo ${p.service} purchase`]);const created=await c.query('INSERT INTO transactions(reference,user_id,service,network,recipient,product,amount_kobo,status,idempotency_key,demo) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,true) RETURNING id,reference',[reference,req.user!.id,p.service,p.network,p.recipient,product,amountKobo,'PROCESSING',key]);tx=created.rows[0];await c.query('COMMIT');}catch(e:any){await c.query('ROLLBACK');return res.status(e.http??500).json({error:e.http?e.message:'Could not start transaction.'});}finally{c.release();}
-  // The mock adapter is the only selected provider. A timeout is kept PROCESSING; never retry the provider call automatically.
-  try{const result=await mockProvider.purchase({service:p.service,network:p.network,recipient:p.recipient,product:tx.product??p.service,amountKobo:0});const c2=await pool.connect();try{await c2.query('BEGIN');const updated=await c2.query('UPDATE transactions SET status=$1,response_details=$2 WHERE id=$3 RETURNING *',[result.status,result.detail,tx.id]);if(result.status==='FAILED'){const w=await c2.query('SELECT id FROM wallets WHERE user_id=$1 FOR UPDATE',[req.user!.id]);const refundRef=`REF-${tx.reference}`;const exists=await c2.query('SELECT 1 FROM refunds WHERE transaction_id=$1',[tx.id]);if(!exists.rowCount){await c2.query('UPDATE wallets SET balance_kobo=balance_kobo+$1 WHERE id=$2',[Number(tx.amount_kobo),w.rows[0].id]);await c2.query('INSERT INTO refunds(transaction_id,reference,amount_kobo) VALUES($1,$2,$3)',[tx.id,refundRef,Number(tx.amount_kobo)]);await c2.query('INSERT INTO wallet_ledger(wallet_id,amount_kobo,entry_type,reference,description) VALUES($1,$2,$3,$4,$5)',[w.rows[0].id,Number(tx.amount_kobo),'REFUND',refundRef,'Demo purchase final failure refund']);}}await c2.query('COMMIT');res.status(201).json(updated.rows[0]);}catch{await c2.query('ROLLBACK');res.status(202).json({reference:tx.reference,status:'PROCESSING',demo:true});}finally{c2.release();}}catch{res.status(202).json({reference:tx.reference,status:'PROCESSING',demo:true});}});
-app.post('/api/admin/login',adminLimiter,async(req,res)=>{const parsed=z.object({email:z.string().email(),password:z.string().min(1).max(128)}).safeParse(req.body);if(!parsed.success)return res.status(400).json({error:'Invalid credentials.'});try{const r=await pool.query('SELECT id,account_id,name,email,password_hash,role FROM users WHERE email=$1 AND role=$2 AND suspended=false',[parsed.data.email.toLowerCase(),'ADMIN']);const u=r.rows[0];if(!u||!await bcrypt.compare(parsed.data.password,u.password_hash))return res.status(401).json({error:'Invalid administrator credentials.'});req.session.regenerate(err=>{if(err)return res.status(500).json({error:'Session error.'});req.session.userId=u.id;req.session.save(e=>e?res.status(500).json({error:'Session error.'}):res.json({name:u.name,email:u.email}));});}catch{res.status(500).json({error:'Admin sign-in unavailable.'});}});
-app.get('/api/admin/overview',admin,async(_req,res)=>{try{const [counts,sales]=await Promise.all([pool.query("SELECT count(*)::int total,count(*) FILTER(WHERE status='SUCCESSFUL')::int successful,count(*) FILTER(WHERE status='FAILED')::int failed,count(*) FILTER(WHERE status IN('PENDING','PROCESSING'))::int pending FROM transactions"),pool.query("SELECT COALESCE(sum(amount_kobo),0)::int sales FROM transactions WHERE status='SUCCESSFUL' AND demo=true")]);const users=await pool.query('SELECT count(*)::int count FROM users WHERE role=\'CUSTOMER\'');res.json({users:users.rows[0].count,...counts.rows[0],demoSalesKobo:sales.rows[0].sales,provider:'MOCK DEMO'});}catch{res.status(500).json({error:'Admin data unavailable.'});}});
-app.get('/api/admin/users',admin,async(req,res)=>{const q=String(req.query.q??'').slice(0,80);try{const r=await pool.query('SELECT id,account_id AS "accountId",name,email,phone,suspended,created_at AS "createdAt" FROM users WHERE role=$1 AND (email ILIKE $2 OR name ILIKE $2 OR phone ILIKE $2) ORDER BY created_at DESC LIMIT 100',['CUSTOMER',`%${q}%`]);res.json(r.rows);}catch{res.status(500).json({error:'Users unavailable.'});}});
-app.post('/api/admin/users/:id/suspend',admin,async(req:AuthedRequest,res)=>{const p=z.object({suspended:z.boolean()}).safeParse(req.body);if(!p.success)return res.status(400).json({error:'Invalid state.'});try{await pool.query('UPDATE users SET suspended=$1 WHERE id=$2 AND role=$3',[p.data.suspended,req.params.id,'CUSTOMER']);await writeAudit(req.user!.id,'USER_SUSPENSION',req.params.id,String(p.data.suspended));res.json({ok:true});}catch{res.status(500).json({error:'Update failed.'});}});
-app.get('/api/admin/transactions',admin,async(req,res)=>{const status=String(req.query.status??'');try{const r=await pool.query('SELECT reference,user_id AS "userId",service,network,recipient,product,amount_kobo AS "amountKobo",status,created_at AS "createdAt" FROM transactions WHERE ($1=\'\' OR status=$1) ORDER BY created_at DESC LIMIT 250',[status]);res.json(r.rows);}catch{res.status(500).json({error:'Transactions unavailable.'});}});
-app.post('/api/admin/plans',admin,async(req:AuthedRequest,res)=>{const p=z.object({network:z.enum(['MTN','Airtel','Glo','9mobile']),size:z.string().min(1).max(40),validity:z.string().min(1).max(40),category:z.string().min(1).max(40),priceKobo:z.number().int().positive().max(100000000)}).safeParse(req.body);if(!p.success)return res.status(400).json({error:'Invalid plan.'});try{const r=await pool.query('INSERT INTO data_plans(network,size,validity,category,price_kobo,is_demo) VALUES($1,$2,$3,$4,$5,true) RETURNING *',[p.data.network,p.data.size,p.data.validity,p.data.category,p.data.priceKobo]);await writeAudit(req.user!.id,'PLAN_CREATED',r.rows[0].id);res.status(201).json(r.rows[0]);}catch{res.status(500).json({error:'Could not create plan.'});}});
-app.put('/api/admin/plans/:id',admin,async(req:AuthedRequest,res)=>{const p=z.object({priceKobo:z.number().int().positive().optional(),active:z.boolean().optional()}).refine(v=>v.priceKobo!==undefined||v.active!==undefined).safeParse(req.body);if(!p.success)return res.status(400).json({error:'Invalid plan update.'});try{const r=await pool.query('UPDATE data_plans SET price_kobo=COALESCE($1,price_kobo),active=COALESCE($2,active) WHERE id=$3 RETURNING *',[p.data.priceKobo??null,p.data.active??null,req.params.id]);await writeAudit(req.user!.id,'PLAN_UPDATED',req.params.id);res.json(r.rows[0]);}catch{res.status(500).json({error:'Plan update failed.'});}});
-app.get('/api/notifications',requireUser,async(req:AuthedRequest,res)=>{try{const r=await pool.query('SELECT id,title,body,read,created_at AS "createdAt" FROM notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50',[req.user!.id]);res.json(r.rows);}catch{res.status(500).json({error:'Notifications unavailable.'});}});
-app.use((err:unknown,_req:express.Request,res:express.Response,_next:express.NextFunction)=>{console.error(err);res.status(500).json({error:'Unexpected server error.'});});
-const port=Number(process.env.PORT)||3001;
-app.listen(port,'0.0.0.0',()=>console.log(`Alexsub demo API listening on ${port}`));
+const admin = (req: AuthedRequest, res: express.Response, next: express.NextFunction) => {
+  void requireUser(req, res, () => req.user?.role === 'ADMIN'
+    ? next()
+    : res.status(403).json({ error: 'Administrator access required.' }));
+};
+const writeAudit = (actor: string, action: string, target?: string, details?: string) =>
+  pool.query('INSERT INTO audit_logs(actor_id,action,target,details) VALUES($1,$2,$3,$4)', [actor, action, target ?? null, details ?? null]);
+
+app.get('/api/health', async (_req, res) => {
+  try { await pool.query('SELECT 1'); res.json({ ok: true, demo: true, provider: 'mock', database: 'connected' }); }
+  catch { res.status(503).json({ ok: false, database: 'unavailable' }); }
+});
+app.get('/api/plans', async (_req, res) => {
+  try {
+    const { rows } = await pool.query('SELECT id,network,size,validity,category,price_kobo AS "priceKobo",is_demo AS "isDemo" FROM data_plans WHERE active=true ORDER BY network,price_kobo');
+    res.json(rows);
+  } catch { res.status(500).json({ error: 'Plans unavailable.' }); }
+});
+app.post('/api/auth/register', authLimiter, async (req, res) => {
+  const parsed = z.object({ name: z.string().trim().min(2).max(80), email: z.string().trim().email().max(254), phone: z.string().regex(/^\+?[0-9]{10,14}$/), password: z.string().min(8).max(128) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Check the registration details.' });
+  const { name, email, phone, password } = parsed.data;
+  const c = await pool.connect();
+  try {
+    await c.query('BEGIN');
+    const hash = await bcrypt.hash(password, 12);
+    const { rows } = await c.query('INSERT INTO users(account_id,name,email,phone,password_hash) VALUES($1,$2,$3,$4,$5) RETURNING id,account_id AS "accountId",name,email', [`AX-${randomUUID().slice(0, 10).toUpperCase()}`, name, email.toLowerCase(), phone, hash]);
+    const u = rows[0];
+    await c.query('INSERT INTO wallets(user_id) VALUES($1)', [u.id]);
+    await c.query('INSERT INTO notifications(user_id,title,body) VALUES($1,$2,$3)', [u.id, 'Welcome to Alexsub', 'Your demo account is ready.']);
+    await c.query('COMMIT');
+    req.session.userId = u.id;
+    req.session.save(err => err ? res.status(500).json({ error: 'Account created, but session could not be saved. Please sign in.' }) : res.status(201).json({ id: u.accountId, name: u.name, email: u.email }));
+  } catch (e: any) {
+    await c.query('ROLLBACK');
+    res.status(e.code === '23505' ? 409 : 500).json({ error: e.code === '23505' ? 'An account with this email already exists.' : 'Registration failed.' });
+  } finally { c.release(); }
+});
+app.post('/api/auth/login', authLimiter, async (req, res) => {
+  const parsed = z.object({ email: z.string().email(), password: z.string().min(1).max(128) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Enter a valid email and password.' });
+  try {
+    const { rows } = await pool.query('SELECT id,account_id AS "accountId",name,email,password_hash,suspended,role FROM users WHERE email=$1', [parsed.data.email.toLowerCase()]);
+    const u = rows[0];
+    if (!u || u.suspended || !await bcrypt.compare(parsed.data.password, u.password_hash)) return res.status(401).json({ error: 'Email or password is incorrect.' });
+    req.session.regenerate(err => {
+      if (err) return res.status(500).json({ error: 'Could not create session.' });
+      req.session.userId = u.id;
+      req.session.save(saveErr => saveErr ? res.status(500).json({ error: 'Could not save session.' }) : res.json({ id: u.accountId, name: u.name, email: u.email, role: u.role }));
+    });
+  } catch { res.status(500).json({ error: 'Sign in unavailable.' }); }
+});
+app.get('/api/auth/me', requireUser, (req: AuthedRequest, res) => res.json({ id: req.user!.id, name: req.user!.name, email: req.user!.email, role: req.user!.role }));
+app.post('/api/auth/logout', (req, res) => req.session.destroy(() => { res.clearCookie('alexsub.sid'); res.status(204).end(); }));
+
+app.get('/api/wallet', requireUser, async (req: AuthedRequest, res) => {
+  try { const { rows } = await pool.query('SELECT balance_kobo AS "balanceKobo" FROM wallets WHERE user_id=$1', [req.user!.id]); res.json({ ...rows[0], demo: true }); }
+  catch { res.status(500).json({ error: 'Wallet unavailable.' }); }
+});
+app.get('/api/wallet/ledger', requireUser, async (req: AuthedRequest, res) => {
+  try { const { rows } = await pool.query('SELECT l.amount_kobo AS "amountKobo",l.entry_type AS "entryType",l.reference,l.description,l.created_at AS "createdAt" FROM wallet_ledger l JOIN wallets w ON l.wallet_id=w.id WHERE w.user_id=$1 ORDER BY l.created_at DESC LIMIT 100', [req.user!.id]); res.json(rows); }
+  catch { res.status(500).json({ error: 'Ledger unavailable.' }); }
+});
+app.post('/api/wallet/demo-credit', requireUser, async (req: AuthedRequest, res) => {
+  if (process.env.DEMO_MODE === 'false') return res.status(403).json({ error: 'Demo credits are disabled.' });
+  if (!z.object({ amountNaira: z.literal(5000) }).safeParse(req.body).success) return res.status(400).json({ error: 'Only the fixed demo credit amount is available.' });
+  const ref = `DEMO-${randomUUID()}`; const c = await pool.connect();
+  try {
+    await c.query('BEGIN');
+    const w = await c.query('UPDATE wallets SET balance_kobo=balance_kobo+500000 WHERE user_id=$1 RETURNING id,balance_kobo', [req.user!.id]);
+    if (!w.rowCount) throw new Error('Wallet missing');
+    await c.query('INSERT INTO wallet_ledger(wallet_id,amount_kobo,entry_type,reference,description) VALUES($1,500000,$2,$3,$4)', [w.rows[0].id, 'DEMO_CREDIT', ref, 'Simulated demo credits']);
+    await c.query('INSERT INTO payments(user_id,reference,amount_kobo,status,demo) VALUES($1,$2,500000,$3,true)', [req.user!.id, ref, 'SIMULATED']);
+    await c.query('INSERT INTO notifications(user_id,title,body) VALUES($1,$2,$3)', [req.user!.id, 'Demo credits added', '₦5,000 simulated credits added; not real money.']);
+    await c.query('COMMIT'); res.json({ balanceKobo: w.rows[0].balance_kobo, demo: true });
+  } catch { await c.query('ROLLBACK'); res.status(500).json({ error: 'Could not add demo credits.' }); }
+  finally { c.release(); }
+});
+app.get('/api/transactions', requireUser, async (req: AuthedRequest, res) => {
+  try { const { rows } = await pool.query('SELECT reference,service,network,recipient,product,amount_kobo AS "amountKobo",status,created_at AS "createdAt",demo FROM transactions WHERE user_id=$1 ORDER BY created_at DESC LIMIT 100', [req.user!.id]); res.json(rows); }
+  catch { res.status(500).json({ error: 'Transactions unavailable.' }); }
+});
+
+app.post('/api/transactions/purchase', requireUser, async (req: AuthedRequest, res) => {
+  if (process.env.DEMO_MODE === 'false') return res.status(403).json({ error: 'Demo purchase engine is disabled.' });
+  const key = req.get('Idempotency-Key');
+  if (!key || key.length > 100) return res.status(400).json({ error: 'A valid idempotency key is required.' });
+  const parsed = z.object({ service: z.enum(['DATA', 'AIRTIME']), network: z.enum(['MTN', 'Airtel', 'Glo', '9mobile']), recipient: z.string().regex(/^\+?[0-9]{10,14}$/), planId: z.string().uuid().optional(), amountNaira: z.number().min(50).max(10000).optional() }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Check the purchase details.' });
+  const p = parsed.data; const c = await pool.connect(); let tx: { id: string; reference: string; product: string; amount_kobo: number };
+  try {
+    await c.query('BEGIN');
+    const prior = await c.query('SELECT reference,status FROM transactions WHERE user_id=$1 AND idempotency_key=$2', [req.user!.id, key]);
+    if (prior.rowCount) { await c.query('COMMIT'); return res.json({ ...prior.rows[0], demo: true }); }
+    let product: string; let amountKobo: number;
+    if (p.service === 'DATA') {
+      if (!p.planId) throw Object.assign(new Error('Select a data plan.'), { http: 400 });
+      const plan = await c.query('SELECT size,network,price_kobo FROM data_plans WHERE id=$1 AND active=true', [p.planId]);
+      if (!plan.rowCount || plan.rows[0].network !== p.network) throw Object.assign(new Error('Invalid data plan.'), { http: 400 });
+      product = plan.rows[0].size; amountKobo = plan.rows[0].price_kobo;
+    } else {
+      if (!p.amountNaira) throw Object.assign(new Error('Enter airtime amount.'), { http: 400 });
+      product = `₦${p.amountNaira} Airtime`; amountKobo = Math.round(p.amountNaira * 100);
+    }
+    const wallet = await c.query('SELECT id,balance_kobo FROM wallets WHERE user_id=$1 FOR UPDATE', [req.user!.id]);
+    if (!wallet.rowCount || wallet.rows[0].balance_kobo < amountKobo) throw Object.assign(new Error('Insufficient demo balance. Add demo credits first.'), { http: 400 });
+    const reference = `AXD-${randomUUID().slice(0, 12).toUpperCase()}`;
+    await c.query('UPDATE wallets SET balance_kobo=balance_kobo-$1 WHERE id=$2', [amountKobo, wallet.rows[0].id]);
+    await c.query('INSERT INTO wallet_ledger(wallet_id,amount_kobo,entry_type,reference,description) VALUES($1,$2,$3,$4,$5)', [wallet.rows[0].id, -amountKobo, 'PURCHASE', reference, `Demo ${p.service} purchase`]);
+    const inserted = await c.query('INSERT INTO transactions(reference,user_id,service,network,recipient,product,amount_kobo,status,idempotency_key,demo) VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,true) RETURNING id,reference,product,amount_kobo', [reference, req.user!.id, p.service, p.network, p.recipient, product, amountKobo, 'PROCESSING', key]);
+    tx = inserted.rows[0];
+    await c.query('COMMIT');
+  } catch (e: any) {
+    await c.query('ROLLBACK');
+    if (e.code === '23505') {
+      const old = await pool.query('SELECT reference,status FROM transactions WHERE user_id=$1 AND idempotency_key=$2', [req.user!.id, key]);
+      if (old.rowCount) return res.json({ ...old.rows[0], demo: true });
+    }
+    return res.status(e.http ?? 500).json({ error: e.http ? e.message : 'Could not start transaction.' });
+  } finally { c.release(); }
+
+  // Only the mock adapter is active. If provider/finalization is uncertain, preserve PROCESSING and never resubmit automatically.
+  try {
+    const result = await mockProvider.purchase({ service: p.service, network: p.network, recipient: p.recipient, product: tx.product, amountKobo: tx.amount_kobo });
+    const c2 = await pool.connect();
+    try {
+      await c2.query('BEGIN');
+      const updated = await c2.query('UPDATE transactions SET status=$1,response_details=$2,provider_reference=$3 WHERE id=$4 AND status=$5 RETURNING reference,status,service,network,recipient,product,amount_kobo AS "amountKobo",created_at AS "createdAt",demo', [result.status, result.detail, result.providerReference ?? null, tx.id, 'PROCESSING']);
+      if (!updated.rowCount) throw new Error('Transaction state changed');
+      if (result.status === 'FAILED') {
+        const w = await c2.query('SELECT id FROM wallets WHERE user_id=$1 FOR UPDATE', [req.user!.id]);
+        const refundRef = `REF-${tx.reference}`;
+        await c2.query('INSERT INTO refunds(transaction_id,reference,amount_kobo) VALUES($1,$2,$3) ON CONFLICT(transaction_id) DO NOTHING', [tx.id, refundRef, tx.amount_kobo]);
+        const refund = await c2.query('SELECT id FROM refunds WHERE transaction_id=$1', [tx.id]);
+        if (refund.rowCount) {
+          const ledger = await c2.query('INSERT INTO wallet_ledger(wallet_id,amount_kobo,entry_type,reference,description) VALUES($1,$2,$3,$4,$5) ON CONFLICT(reference) DO NOTHING RETURNING id', [w.rows[0].id, tx.amount_kobo, 'REFUND', refundRef, 'Final demo purchase failure refund']);
+          if (ledger.rowCount) await c2.query('UPDATE wallets SET balance_kobo=balance_kobo+$1 WHERE id=$2', [tx.amount_kobo, w.rows[0].id]);
+        }
+        await c2.query('INSERT INTO notifications(user_id,title,body) VALUES($1,$2,$3)', [req.user!.id, 'Demo purchase failed', 'Your simulated purchase failed; demo credits were returned.']);
+      } else if (result.status === 'SUCCESSFUL') {
+        await c2.query('INSERT INTO notifications(user_id,title,body) VALUES($1,$2,$3)', [req.user!.id, 'Demo purchase successful', 'Your simulated purchase completed.']);
+      }
+      await c2.query('COMMIT'); res.status(201).json(updated.rows[0]);
+    } catch { await c2.query('ROLLBACK'); res.status(202).json({ reference: tx.reference, status: 'PROCESSING', demo: true }); }
+    finally { c2.release(); }
+  } catch { res.status(202).json({ reference: tx.reference, status: 'PROCESSING', demo: true }); }
+});
+
+app.post('/api/admin/login', adminLimiter, async (req, res) => {
+  const parsed = z.object({ email: z.string().email(), password: z.string().min(1).max(128) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error: 'Invalid credentials.' });
+  try {
+    const { rows } = await pool.query('SELECT id,account_id,name,email,password_hash FROM users WHERE email=$1 AND role=$2 AND suspended=false', [parsed.data.email.toLowerCase(), 'ADMIN']);
+    const u = rows[0]; if (!u || !await bcrypt.compare(parsed.data.password, u.password_hash)) return res.status(401).json({ error: 'Invalid administrator credentials.' });
+    req.session.regenerate(err => {
+      if (err) return res.status(500).json({ error: 'Session error.' });
+      req.session.userId = u.id; req.session.save(saveErr => saveErr ? res.status(500).json({ error: 'Session error.' }) : res.json({ id: u.account_id, name: u.name, email: u.email }));
+    });
+  } catch { res.status(500).json({ error: 'Admin sign-in unavailable.' }); }
+});
+app.get('/api/admin/overview', admin, async (_req, res) => {
+  try {
+    const [counts, sales, users] = await Promise.all([
+      pool.query("SELECT count(*)::int total,count(*) FILTER(WHERE status='SUCCESSFUL')::int successful,count(*) FILTER(WHERE status='FAILED')::int failed,count(*) FILTER(WHERE status IN('PENDING','PROCESSING'))::int pending FROM transactions"),
+      pool.query("SELECT COALESCE(sum(amount_kobo),0)::int sales FROM transactions WHERE status='SUCCESSFUL' AND demo=true"),
+      pool.query("SELECT count(*)::int count FROM users WHERE role='CUSTOMER'")
+    ]);
+    res.json({ users: users.rows[0].count, ...counts.rows[0], demoSalesKobo: sales.rows[0].sales, provider: 'MOCK DEMO' });
+  } catch { res.status(500).json({ error: 'Admin data unavailable.' }); }
+});
+app.get('/api/admin/users', admin, async (req, res) => {
+  const q = String(req.query.q ?? '').slice(0, 80);
+  try { const { rows } = await pool.query('SELECT id,account_id AS "accountId",name,email,phone,suspended,created_at AS "createdAt" FROM users WHERE role=$1 AND (email ILIKE $2 OR name ILIKE $2 OR phone ILIKE $2) ORDER BY created_at DESC LIMIT 100', ['CUSTOMER', `%${q}%`]); res.json(rows); }
+  catch { res.status(500).json({ error: 'Users unavailable.' }); }
+});
+app.post('/api/admin/users/:id/suspend', admin, async (req: AuthedRequest, res) => {
+  const p = z.object({ suspended: z.boolean() }).safeParse(req.body); if (!p.success) return res.status(400).json({ error: 'Invalid state.' });
+  try { await pool.query('UPDATE users SET suspended=$1 WHERE id=$2 AND role=$3', [p.data.suspended, req.params.id, 'CUSTOMER']); await writeAudit(req.user!.id, 'USER_SUSPENSION', req.params.id, String(p.data.suspended)); res.json({ ok: true }); }
+  catch { res.status(500).json({ error: 'Update failed.' }); }
+});
+app.get('/api/admin/transactions', admin, async (req, res) => {
+  const status = String(req.query.status ?? '');
+  try { const { rows } = await pool.query('SELECT reference,user_id AS "userId",service,network,recipient,product,amount_kobo AS "amountKobo",status,created_at AS "createdAt" FROM transactions WHERE ($1=\'\' OR status=$1) ORDER BY created_at DESC LIMIT 250', [status]); res.json(rows); }
+  catch { res.status(500).json({ error: 'Transactions unavailable.' }); }
+});
+app.post('/api/admin/plans', admin, async (req: AuthedRequest, res) => {
+  const p = z.object({ network: z.enum(['MTN','Airtel','Glo','9mobile']), size: z.string().min(1).max(40), validity: z.string().min(1).max(40), category: z.string().min(1).max(40), priceKobo: z.number().int().positive().max(100000000) }).safeParse(req.body);
+  if (!p.success) return res.status(400).json({ error: 'Invalid plan.' });
+  try { const { rows } = await pool.query('INSERT INTO data_plans(network,size,validity,category,price_kobo,is_demo) VALUES($1,$2,$3,$4,$5,true) RETURNING *', [p.data.network,p.data.size,p.data.validity,p.data.category,p.data.priceKobo]); await writeAudit(req.user!.id, 'PLAN_CREATED', rows[0].id); res.status(201).json(rows[0]); }
+  catch { res.status(500).json({ error: 'Could not create plan.' }); }
+});
+app.put('/api/admin/plans/:id', admin, async (req: AuthedRequest, res) => {
+  const p = z.object({ priceKobo: z.number().int().positive().optional(), active: z.boolean().optional() }).refine(v => v.priceKobo !== undefined || v.active !== undefined).safeParse(req.body);
+  if (!p.success) return res.status(400).json({ error: 'Invalid plan update.' });
+  try { const { rows } = await pool.query('UPDATE data_plans SET price_kobo=COALESCE($1,price_kobo),active=COALESCE($2,active) WHERE id=$3 RETURNING *', [p.data.priceKobo ?? null,p.data.active ?? null,req.params.id]); if (!rows[0]) return res.status(404).json({ error: 'Plan not found.' }); await writeAudit(req.user!.id, 'PLAN_UPDATED', req.params.id); res.json(rows[0]); }
+  catch { res.status(500).json({ error: 'Plan update failed.' }); }
+});
+app.get('/api/notifications', requireUser, async (req: AuthedRequest, res) => {
+  try { const { rows } = await pool.query('SELECT id,title,body,read,created_at AS "createdAt" FROM notifications WHERE user_id=$1 ORDER BY created_at DESC LIMIT 50', [req.user!.id]); res.json(rows); }
+  catch { res.status(500).json({ error: 'Notifications unavailable.' }); }
+});
+app.use((err: unknown, _req: express.Request, res: express.Response, _next: express.NextFunction) => { console.error(err); res.status(500).json({ error: 'Unexpected server error.' }); });
+const port = Number(process.env.PORT) || 3001;
+app.listen(port, '0.0.0.0', () => console.log(`Alexsub demo API listening on ${port}`));

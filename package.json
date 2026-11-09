@@ -10,6 +10,7 @@
     "build": "tsc --noEmit && vite build",
     "start": "tsx server/index.ts",
     "db:migrate": "psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -f server/db/migrations/0001_init.sql",
+    "db:seed-admin": "tsx server/db/seedAdmin.ts",
     "db:generate": "drizzle-kit generate",
     "db:studio": "drizzle-kit studio"
   },
